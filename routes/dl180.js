@@ -20,7 +20,7 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   });
-});
+};
 
 // Schema for DL-180 form data
 const dl180Schema = new mongoose.Schema({
