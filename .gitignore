@@ -1,0 +1,8 @@
+node_modules/
+*.pdf
+.env
+config.env
+.DS_Store
+*.log
+client/node_modules/
+client/build/

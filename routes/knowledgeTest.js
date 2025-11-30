@@ -1,44 +1,102 @@
 const express = require('express');
-const { Question, TestResult } = require('../models/Test');
+const { Question, TestResult, UserQuestionPerformance } = require('../models/Test');
 const User = require('../models/User');
+const authenticateToken = require('../middleware/auth');
 
 const router = express.Router();
 
-// Middleware to verify JWT token
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ message: 'Access token required' });
-  }
-
-  const jwt = require('jsonwebtoken');
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ message: 'Invalid or expired token' });
-    }
-    req.user = user;
-    next();
-  });
-};
-
-// Get random questions for practice test
+// Get random questions for practice test with adaptive learning
 router.get('/questions', authenticateToken, async (req, res) => {
   try {
     const { count = 18, category } = req.query;
+    const userId = req.user.userId;
+    const questionCount = parseInt(count);
     
     let query = { isActive: true };
     if (category) {
       query.category = category;
     }
 
-    const questions = await Question.find(query)
-      .limit(parseInt(count))
-      .sort({ _id: 1 }); // Simple randomization
+    // Get all eligible questions
+    const allQuestions = await Question.find(query);
 
-    // Shuffle questions
-    const shuffledQuestions = questions.sort(() => Math.random() - 0.5);
+    if (allQuestions.length === 0) {
+      return res.status(404).json({ message: 'No questions found' });
+    }
+
+    // Get user's performance data for adaptive learning
+    const userPerformance = await UserQuestionPerformance.find({ userId });
+    const performanceMap = {};
+    userPerformance.forEach(perf => {
+      performanceMap[perf.questionId] = perf;
+    });
+
+    // Calculate weights for each question based on performance
+    // Questions with lower correct rates get higher weights (appear more frequently)
+    const questionsWithWeights = allQuestions.map(q => {
+      const perf = performanceMap[q.questionId];
+      let weight = 1.0; // Default weight
+
+      if (perf && perf.timesAnswered > 0) {
+        const correctRate = perf.timesCorrect / perf.timesAnswered;
+        // Inverse relationship: lower correct rate = higher weight
+        // Weight ranges from 0.1 (always correct) to 5.0 (never correct)
+        weight = Math.max(0.1, Math.min(5.0, 2.0 - (correctRate * 1.9)));
+        
+        // Bonus weight for recently incorrect questions
+        if (perf.lastIncorrect) {
+          const daysSinceIncorrect = (Date.now() - perf.lastIncorrect) / (1000 * 60 * 60 * 24);
+          if (daysSinceIncorrect < 7) {
+            weight *= 1.5; // 50% bonus for questions missed in last 7 days
+          }
+        }
+      }
+
+      return { question: q, weight };
+    });
+
+    // Weighted random selection
+    const selectedQuestions = [];
+    const selectedIds = new Set();
+    let availableQuestions = [...questionsWithWeights];
+    
+    // Select questions using weighted random
+    let attempts = 0;
+    const maxAttempts = questionCount * 10; // Prevent infinite loops
+    
+    while (selectedQuestions.length < Math.min(questionCount, allQuestions.length) && availableQuestions.length > 0 && attempts < maxAttempts) {
+      attempts++;
+      
+      // Recalculate total weight for remaining questions
+      let totalWeight = availableQuestions.reduce((sum, item) => sum + item.weight, 0);
+      if (totalWeight === 0) totalWeight = 1; // Prevent division by zero
+      
+      let random = Math.random() * totalWeight;
+      
+      for (let i = 0; i < availableQuestions.length; i++) {
+        const item = availableQuestions[i];
+        random -= item.weight;
+        if (random <= 0 && !selectedIds.has(item.question.questionId)) {
+          selectedQuestions.push(item.question);
+          selectedIds.add(item.question.questionId);
+          // Remove from available to prevent duplicates
+          availableQuestions = availableQuestions.filter(aq => aq.question.questionId !== item.question.questionId);
+          break;
+        }
+      }
+    }
+
+    // If we still need more questions, fill randomly from remaining
+    if (selectedQuestions.length < questionCount) {
+      const remaining = allQuestions
+        .filter(q => !selectedIds.has(q.questionId))
+        .sort(() => Math.random() - 0.5)
+        .slice(0, questionCount - selectedQuestions.length);
+      selectedQuestions.push(...remaining);
+    }
+
+    // Shuffle final selection for randomness
+    const shuffledQuestions = selectedQuestions.sort(() => Math.random() - 0.5);
 
     // Remove correct answers from response
     const questionsForTest = shuffledQuestions.map(q => ({
@@ -71,6 +129,16 @@ router.post('/submit', authenticateToken, async (req, res) => {
       questionId: { $in: questionIds } 
     }).select('questionId correctAnswer question options');
 
+    // Validate all questions exist
+    if (correctAnswers.length !== questionIds.length) {
+      const foundIds = new Set(correctAnswers.map(q => q.questionId));
+      const missingIds = questionIds.filter(id => !foundIds.has(id));
+      return res.status(400).json({ 
+        message: 'Some questions were not found in database',
+        missingQuestionIds: missingIds
+      });
+    }
+
     // Create answer lookup
     const answerLookup = {};
     correctAnswers.forEach(q => {
@@ -85,17 +153,23 @@ router.post('/submit', authenticateToken, async (req, res) => {
     let score = 0;
     const scoredQuestions = questions.map(q => {
       const correct = answerLookup[q.questionId];
-      const isCorrect = q.selectedAnswer === correct.correctAnswer;
+      if (!correct) {
+        console.error(`Question ${q.questionId} not found in answerLookup`);
+        return null;
+      }
+      
+      const isCorrect = q.selectedAnswer && 
+                        q.selectedAnswer === correct.correctAnswer;
       if (isCorrect) score++;
 
       return {
         questionId: q.questionId,
         question: correct.question,
-        selectedAnswer: q.selectedAnswer,
+        selectedAnswer: q.selectedAnswer || '',
         correctAnswer: correct.correctAnswer,
         isCorrect
       };
-    });
+    }).filter(q => q !== null); // Remove any null entries
 
     const passed = score >= 15; // Need 15 out of 18 to pass
 
@@ -110,6 +184,46 @@ router.post('/submit', authenticateToken, async (req, res) => {
     });
 
     await testResult.save();
+
+    // Update individual question performance for adaptive learning
+    const userId = req.user.userId;
+    const now = new Date();
+    
+    for (const q of scoredQuestions) {
+      const updateData = {
+        userId,
+        questionId: q.questionId,
+        $inc: {
+          timesAnswered: 1,
+          ...(q.isCorrect ? { timesCorrect: 1 } : { timesIncorrect: 1 })
+        },
+        lastAnswered: now,
+        ...(q.isCorrect ? { lastCorrect: now } : { lastIncorrect: now })
+      };
+
+      // Calculate and update weight based on performance
+      const existingPerf = await UserQuestionPerformance.findOne({
+        userId,
+        questionId: q.questionId
+      });
+
+      let newTimesAnswered = (existingPerf?.timesAnswered || 0) + 1;
+      let newTimesCorrect = q.isCorrect 
+        ? (existingPerf?.timesCorrect || 0) + 1 
+        : (existingPerf?.timesCorrect || 0);
+      
+      const correctRate = newTimesAnswered > 0 ? newTimesCorrect / newTimesAnswered : 0.5;
+      // Weight ranges from 0.1 (always correct) to 5.0 (never correct)
+      const weight = Math.max(0.1, Math.min(5.0, 2.0 - (correctRate * 1.9)));
+
+      updateData.weight = weight;
+
+      await UserQuestionPerformance.findOneAndUpdate(
+        { userId, questionId: q.questionId },
+        updateData,
+        { upsert: true, new: true }
+      );
+    }
 
     // Update user's license status if they passed
     if (passed && testType === 'practice') {

@@ -87,7 +87,13 @@ A comprehensive web application designed to help military personnel navigate the
    FRONTEND_URL=http://localhost:3000
    ```
 
-3. **Start the server:**
+3. **Seed the database with questions (first time only):**
+   ```bash
+   npm run seed:questions
+   ```
+   > **Note:** Make sure MongoDB is running. For MongoDB setup, either install locally or use MongoDB Atlas (cloud).
+
+4. **Start the server:**
    ```bash
    npm run dev
    ```
